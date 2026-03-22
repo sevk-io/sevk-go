@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.sevk.email/api"
+	defaultBaseURL = "https://api.sevk.io"
 	defaultTimeout = 30 * time.Second
 )
 
@@ -32,6 +32,8 @@ type Client struct {
 	Segments      *SegmentsResource
 	Subscriptions *SubscriptionsResource
 	Emails        *EmailsResource
+	Webhooks      *WebhooksResource
+	Events        *EventsResource
 }
 
 // Options for configuring the Sevk client
@@ -78,6 +80,8 @@ func NewWithOptions(apiKey string, opts Options) *Client {
 	c.Segments = &SegmentsResource{client: c}
 	c.Subscriptions = &SubscriptionsResource{client: c}
 	c.Emails = &EmailsResource{client: c}
+	c.Webhooks = &WebhooksResource{client: c}
+	c.Events = &EventsResource{client: c}
 
 	return c
 }
@@ -165,4 +169,43 @@ func (c *Client) put(path string, body interface{}, result interface{}) error {
 // delete makes a DELETE request
 func (c *Client) delete(path string) error {
 	return c.request(http.MethodDelete, path, nil, nil)
+}
+
+// Usage represents project usage and limits data
+type Usage struct {
+	Balance        string                 `json:"balance"`
+	EmailPrice     string                 `json:"emailPrice"`
+	AudienceLimit  int                    `json:"audienceLimit"`
+	ContactLimit   int                    `json:"contactLimit"`
+	BroadcastLimit int                    `json:"broadcastLimit"`
+	DomainLimit    int                    `json:"domainLimit"`
+	StorageLimit   string                 `json:"storageLimit"`
+	StorageUsed    string                 `json:"storageUsed"`
+	EmailStats     EmailStats             `json:"emailStats"`
+	EmailLimits    map[string]interface{} `json:"emailLimits"`
+	Count          UsageCount             `json:"_count"`
+}
+
+// EmailStats represents email statistics
+type EmailStats struct {
+	Total         int `json:"total"`
+	Marketing     int `json:"marketing"`
+	Transactional int `json:"transactional"`
+}
+
+// UsageCount represents resource counts
+type UsageCount struct {
+	Audiences  int `json:"audiences"`
+	Contacts   int `json:"contacts"`
+	Broadcasts int `json:"broadcasts"`
+	Domains    int `json:"domains"`
+}
+
+// GetUsage returns project usage and limits
+func (c *Client) GetUsage() (*Usage, error) {
+	var result Usage
+	if err := c.get("/limits", &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }

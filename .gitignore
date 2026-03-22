@@ -30,6 +30,4 @@ Thumbs.db
 # Environment
 .env
 .env.local
-
-cmd
 markup-output.html

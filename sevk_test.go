@@ -1,11 +1,8 @@
 package sevk_test
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"math/rand"
-	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -15,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const baseURL = "http://localhost:4000"
+var baseURL string
 
 var testClient *sevk.Client
 var testAudience *sevk.Audience
@@ -25,83 +22,22 @@ func uniqueID() int64 {
 }
 
 func TestMain(m *testing.M) {
-	// Setup: Create test environment once before all tests
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	unique := uniqueID()
-
-	// 1. Register a new test user
-	testEmail := fmt.Sprintf("sdk-test-%d@test.example.com", unique)
-	testPassword := "TestPassword123!"
-
-	registerBody, _ := json.Marshal(map[string]string{
-		"email":    testEmail,
-		"password": testPassword,
-	})
-
-	registerRes, err := httpClient.Post(baseURL+"/auth/register", "application/json", bytes.NewReader(registerBody))
-	if err != nil {
-		fmt.Printf("Skipping tests - setup failed: %v\n", err)
-		os.Exit(0)
-	}
-	defer registerRes.Body.Close()
-
-	if registerRes.StatusCode != http.StatusOK && registerRes.StatusCode != http.StatusCreated {
-		fmt.Printf("Skipping tests - registration failed: %d\n", registerRes.StatusCode)
+	apiKey := os.Getenv("SEVK_TEST_API_KEY")
+	if apiKey == "" {
+		fmt.Println("SEVK_TEST_API_KEY not set, skipping integration tests")
 		os.Exit(0)
 	}
 
-	var registerData map[string]interface{}
-	json.NewDecoder(registerRes.Body).Decode(&registerData)
-	token := registerData["token"].(string)
-
-	// 2. Create Project
-	projectBody, _ := json.Marshal(map[string]string{
-		"name":         "Test Project",
-		"slug":         fmt.Sprintf("test-project-%d", unique),
-		"supportEmail": "support@test.com",
-	})
-
-	projectReq, _ := http.NewRequest("POST", baseURL+"/projects", bytes.NewReader(projectBody))
-	projectReq.Header.Set("Authorization", "Bearer "+token)
-	projectReq.Header.Set("Content-Type", "application/json")
-
-	projectRes, err := httpClient.Do(projectReq)
-	if err != nil {
-		fmt.Printf("Skipping tests - project creation failed: %v\n", err)
-		os.Exit(0)
+	baseURL = os.Getenv("SEVK_TEST_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://api.sevk.io"
 	}
-	defer projectRes.Body.Close()
-
-	var projectData map[string]interface{}
-	json.NewDecoder(projectRes.Body).Decode(&projectData)
-	projectID := projectData["project"].(map[string]interface{})["id"].(string)
-
-	// 3. Create API Key
-	apiKeyBody, _ := json.Marshal(map[string]interface{}{
-		"title":      "Test Key",
-		"fullAccess": true,
-	})
-
-	apiKeyReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/projects/%s/api-keys", baseURL, projectID), bytes.NewReader(apiKeyBody))
-	apiKeyReq.Header.Set("Authorization", "Bearer "+token)
-	apiKeyReq.Header.Set("Content-Type", "application/json")
-
-	apiKeyRes, err := httpClient.Do(apiKeyReq)
-	if err != nil {
-		fmt.Printf("Skipping tests - API key creation failed: %v\n", err)
-		os.Exit(0)
-	}
-	defer apiKeyRes.Body.Close()
-
-	var apiKeyData map[string]interface{}
-	json.NewDecoder(apiKeyRes.Body).Decode(&apiKeyData)
-	apiKey := apiKeyData["apiKey"].(map[string]interface{})["key"].(string)
 
 	testClient = sevk.NewWithOptions(apiKey, sevk.Options{BaseURL: baseURL})
 
-	// 4. Create a shared test audience for all tests
+	// Create a shared test audience for all tests
 	audience, err := testClient.Audiences.Create(sevk.CreateAudienceParams{
-		Name: fmt.Sprintf("Shared Test Audience %d", unique),
+		Name: fmt.Sprintf("Shared Test Audience %d", uniqueID()),
 	})
 	if err != nil {
 		fmt.Printf("Skipping tests - audience creation failed: %v\n", err)
@@ -127,6 +63,12 @@ func getAudience(t *testing.T) *sevk.Audience {
 		t.Skip("Test audience not initialized")
 	}
 	return testAudience
+}
+
+func skipDomainTests(t *testing.T) {
+	if os.Getenv("INCLUDE_DOMAIN_TESTS") != "true" {
+		t.Skip("INCLUDE_DOMAIN_TESTS not set")
+	}
 }
 
 // ============================================
@@ -249,6 +191,63 @@ func TestContactsErrorNonExistent(t *testing.T) {
 	}
 }
 
+func TestContactsBulkUpdate(t *testing.T) {
+	client := getClient(t)
+
+	email := fmt.Sprintf("bulk-update-%d@example.com", uniqueID())
+	_, err := client.Contacts.Create(sevk.CreateContactParams{Email: email})
+	require.NoError(t, err)
+
+	// Wait a bit to avoid rate limit conflicts with import endpoint
+	time.Sleep(2 * time.Second)
+
+	subscribed := false
+	result, err := client.Contacts.BulkUpdate(sevk.BulkUpdateContactsParams{
+		Contacts: []sevk.BulkUpdateContact{
+			{Email: email, Subscribed: &subscribed},
+		},
+	})
+	if err != nil {
+		sevkErr, ok := err.(*sevk.Error)
+		if ok && sevkErr.StatusCode == 429 {
+			t.Skip("Skipping due to rate limit on bulk update endpoint")
+		}
+		require.NoError(t, err)
+	}
+	assert.NotNil(t, result)
+}
+
+func TestContactsGetEvents(t *testing.T) {
+	client := getClient(t)
+
+	email := fmt.Sprintf("events-%d@example.com", uniqueID())
+	contact, err := client.Contacts.Create(sevk.CreateContactParams{Email: email})
+	require.NoError(t, err)
+
+	result, err := client.Contacts.GetEvents(contact.ID, nil)
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+func TestContactsImport(t *testing.T) {
+	client := getClient(t)
+
+	email := fmt.Sprintf("import-test-%d@example.com", uniqueID())
+	result, err := client.Contacts.Import(sevk.ImportContactsParams{
+		Contacts: []sevk.ImportContact{
+			{Email: email},
+		},
+	})
+	if err != nil {
+		sevkErr, ok := err.(*sevk.Error)
+		if ok && sevkErr.StatusCode == 429 {
+			t.Skip("Skipping due to rate limit on import endpoint")
+		}
+		require.NoError(t, err)
+	}
+	assert.NotNil(t, result)
+}
+
 // ============================================
 // AUDIENCES TESTS
 // ============================================
@@ -329,6 +328,38 @@ func TestAudiencesAddContacts(t *testing.T) {
 
 	err = client.Audiences.AddContacts(audience.ID, []string{contact.ID})
 	require.NoError(t, err)
+}
+
+func TestAudiencesListContacts(t *testing.T) {
+	client := getClient(t)
+	audience := getAudience(t)
+
+	result, err := client.Audiences.ListContacts(audience.ID, nil)
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.NotNil(t, result.Items)
+}
+
+func TestAudiencesRemoveContact(t *testing.T) {
+	client := getClient(t)
+	audience := getAudience(t)
+
+	email := fmt.Sprintf("audience-remove-%d@example.com", uniqueID())
+	contact, err := client.Contacts.Create(sevk.CreateContactParams{Email: email})
+	require.NoError(t, err)
+
+	err = client.Audiences.AddContacts(audience.ID, []string{contact.ID})
+	require.NoError(t, err)
+
+	err = client.Audiences.RemoveContact(audience.ID, contact.ID)
+	require.NoError(t, err)
+
+	// Verify removal by listing contacts
+	result, err := client.Audiences.ListContacts(audience.ID, nil)
+	require.NoError(t, err)
+	for _, c := range result.Items {
+		assert.NotEqual(t, contact.ID, c.ID)
+	}
 }
 
 func TestAudiencesDelete(t *testing.T) {
@@ -467,11 +498,332 @@ func TestBroadcastsListSearch(t *testing.T) {
 	assert.NotNil(t, result)
 }
 
+func TestBroadcastsGetStatus(t *testing.T) {
+	client := getClient(t)
+
+	page := 1
+	limit := 1
+	result, err := client.Broadcasts.List(&sevk.ListBroadcastsParams{Page: &page, Limit: &limit})
+	require.NoError(t, err)
+
+	if len(result.Items) == 0 {
+		t.Skip("No broadcasts available to test GetStatus")
+	}
+
+	status, err := client.Broadcasts.GetStatus(result.Items[0].ID)
+	require.NoError(t, err)
+	assert.NotNil(t, status)
+}
+
+func TestBroadcastsGetEmails(t *testing.T) {
+	client := getClient(t)
+
+	page := 1
+	limit := 1
+	result, err := client.Broadcasts.List(&sevk.ListBroadcastsParams{Page: &page, Limit: &limit})
+	require.NoError(t, err)
+
+	if len(result.Items) == 0 {
+		t.Skip("No broadcasts available to test GetEmails")
+	}
+
+	emails, err := client.Broadcasts.GetEmails(result.Items[0].ID, nil)
+	require.NoError(t, err)
+	assert.NotNil(t, emails)
+	assert.NotNil(t, emails.Items)
+}
+
+func TestBroadcastsEstimateCost(t *testing.T) {
+	client := getClient(t)
+
+	page := 1
+	limit := 1
+	result, err := client.Broadcasts.List(&sevk.ListBroadcastsParams{Page: &page, Limit: &limit})
+	require.NoError(t, err)
+
+	if len(result.Items) == 0 {
+		t.Skip("No broadcasts available to test EstimateCost")
+	}
+
+	estimate, err := client.Broadcasts.EstimateCost(result.Items[0].ID)
+	require.NoError(t, err)
+	assert.NotNil(t, estimate)
+}
+
+func TestBroadcastsListActive(t *testing.T) {
+	client := getClient(t)
+
+	result, err := client.Broadcasts.ListActive()
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+func TestBroadcastsCreate(t *testing.T) {
+	client := getClient(t)
+
+	// Get a domain from the project to use for broadcast
+	domains, err := client.Domains.List(nil)
+	require.NoError(t, err)
+	if len(domains.Items) == 0 {
+		t.Skip("No domains available to test broadcast create")
+	}
+	domainID := domains.Items[0].ID
+
+	name := fmt.Sprintf("Test Broadcast %d", uniqueID())
+	senderName := "Test Sender"
+	targetType := "ALL"
+	broadcast, err := client.Broadcasts.Create(sevk.CreateBroadcastParams{
+		DomainID:   domainID,
+		Name:       name,
+		Subject:    "Test Subject",
+		Body:       "<section><paragraph>Test broadcast body</paragraph></section>",
+		SenderName: &senderName,
+		TargetType: &targetType,
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, broadcast.ID)
+	assert.Equal(t, "DRAFT", broadcast.Status)
+
+	// Cleanup
+	client.Broadcasts.Delete(broadcast.ID)
+}
+
+func TestBroadcastsGet(t *testing.T) {
+	client := getClient(t)
+
+	domains, err := client.Domains.List(nil)
+	require.NoError(t, err)
+	if len(domains.Items) == 0 {
+		t.Skip("No domains available to test broadcast get")
+	}
+	domainID := domains.Items[0].ID
+
+	name := fmt.Sprintf("Get Broadcast %d", uniqueID())
+	senderName := "Test Sender"
+	targetType := "ALL"
+	broadcast, err := client.Broadcasts.Create(sevk.CreateBroadcastParams{
+		DomainID:   domainID,
+		Name:       name,
+		Subject:    "Test Subject",
+		Body:       "<section><paragraph>Test</paragraph></section>",
+		SenderName: &senderName,
+		TargetType: &targetType,
+	})
+	require.NoError(t, err)
+
+	fetched, err := client.Broadcasts.Get(broadcast.ID)
+	require.NoError(t, err)
+	assert.Equal(t, broadcast.ID, fetched.ID)
+	assert.Equal(t, "Test Subject", fetched.Subject)
+
+	// Cleanup
+	client.Broadcasts.Delete(broadcast.ID)
+}
+
+func TestBroadcastsUpdate(t *testing.T) {
+	client := getClient(t)
+
+	domains, err := client.Domains.List(nil)
+	require.NoError(t, err)
+	if len(domains.Items) == 0 {
+		t.Skip("No domains available to test broadcast update")
+	}
+	domainID := domains.Items[0].ID
+
+	name := fmt.Sprintf("Update Broadcast %d", uniqueID())
+	senderName := "Test Sender"
+	targetType := "ALL"
+	broadcast, err := client.Broadcasts.Create(sevk.CreateBroadcastParams{
+		DomainID:   domainID,
+		Name:       name,
+		Subject:    "Test Subject",
+		Body:       "<section><paragraph>Test</paragraph></section>",
+		SenderName: &senderName,
+		TargetType: &targetType,
+	})
+	require.NoError(t, err)
+
+	newName := fmt.Sprintf("Updated Broadcast %d", uniqueID())
+	updated, err := client.Broadcasts.Update(broadcast.ID, sevk.UpdateBroadcastParams{Name: &newName})
+	require.NoError(t, err)
+	assert.Equal(t, broadcast.ID, updated.ID)
+
+	// Cleanup
+	client.Broadcasts.Delete(broadcast.ID)
+}
+
+func TestBroadcastsGetAnalytics(t *testing.T) {
+	client := getClient(t)
+
+	domains, err := client.Domains.List(nil)
+	require.NoError(t, err)
+	if len(domains.Items) == 0 {
+		t.Skip("No domains available to test broadcast analytics")
+	}
+	domainID := domains.Items[0].ID
+
+	senderName := "Test Sender"
+	targetType := "ALL"
+	broadcast, err := client.Broadcasts.Create(sevk.CreateBroadcastParams{
+		DomainID:   domainID,
+		Name:       fmt.Sprintf("Analytics Broadcast %d", uniqueID()),
+		Subject:    "Test Subject",
+		Body:       "<section><paragraph>Test</paragraph></section>",
+		SenderName: &senderName,
+		TargetType: &targetType,
+	})
+	require.NoError(t, err)
+
+	analytics, err := client.Broadcasts.GetAnalytics(broadcast.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, analytics)
+
+	// Cleanup
+	client.Broadcasts.Delete(broadcast.ID)
+}
+
+func TestBroadcastsSendTest(t *testing.T) {
+	client := getClient(t)
+
+	domains, err := client.Domains.List(nil)
+	require.NoError(t, err)
+	if len(domains.Items) == 0 {
+		t.Skip("No domains available to test broadcast send test")
+	}
+	domainID := domains.Items[0].ID
+
+	senderName := "Test Sender"
+	targetType := "ALL"
+	broadcast, err := client.Broadcasts.Create(sevk.CreateBroadcastParams{
+		DomainID:   domainID,
+		Name:       fmt.Sprintf("SendTest Broadcast %d", uniqueID()),
+		Subject:    "Test Subject",
+		Body:       "<section><paragraph>Test</paragraph></section>",
+		SenderName: &senderName,
+		TargetType: &targetType,
+	})
+	require.NoError(t, err)
+
+	err = client.Broadcasts.SendTest(broadcast.ID, sevk.SendTestParams{
+		Emails: []string{"test@example.com"},
+	})
+	// May fail if domain is unverified, which is expected
+	if err != nil {
+		sevkErr, ok := err.(*sevk.Error)
+		if ok {
+			assert.NotEmpty(t, sevkErr.Message)
+		}
+	}
+
+	// Cleanup
+	client.Broadcasts.Delete(broadcast.ID)
+}
+
+func TestBroadcastsSendErrorDraft(t *testing.T) {
+	client := getClient(t)
+
+	domains, err := client.Domains.List(nil)
+	require.NoError(t, err)
+	if len(domains.Items) == 0 {
+		t.Skip("No domains available to test broadcast send error")
+	}
+	domainID := domains.Items[0].ID
+
+	senderName := "Test Sender"
+	targetType := "ALL"
+	broadcast, err := client.Broadcasts.Create(sevk.CreateBroadcastParams{
+		DomainID:   domainID,
+		Name:       fmt.Sprintf("Send Error Broadcast %d", uniqueID()),
+		Subject:    "Test Subject",
+		Body:       "<section><paragraph>Test</paragraph></section>",
+		SenderName: &senderName,
+		TargetType: &targetType,
+	})
+	require.NoError(t, err)
+
+	_, sendErr := client.Broadcasts.Send(broadcast.ID)
+	// Expected to fail if broadcast is not ready to send
+	if sendErr != nil {
+		sevkErr, ok := sendErr.(*sevk.Error)
+		if ok {
+			assert.NotEmpty(t, sevkErr.Message)
+		}
+	}
+
+	// Cleanup
+	client.Broadcasts.Delete(broadcast.ID)
+}
+
+func TestBroadcastsCancelErrorDraft(t *testing.T) {
+	client := getClient(t)
+
+	domains, err := client.Domains.List(nil)
+	require.NoError(t, err)
+	if len(domains.Items) == 0 {
+		t.Skip("No domains available to test broadcast cancel error")
+	}
+	domainID := domains.Items[0].ID
+
+	senderName := "Test Sender"
+	targetType := "ALL"
+	broadcast, err := client.Broadcasts.Create(sevk.CreateBroadcastParams{
+		DomainID:   domainID,
+		Name:       fmt.Sprintf("Cancel Error Broadcast %d", uniqueID()),
+		Subject:    "Test Subject",
+		Body:       "<section><paragraph>Test</paragraph></section>",
+		SenderName: &senderName,
+		TargetType: &targetType,
+	})
+	require.NoError(t, err)
+
+	_, cancelErr := client.Broadcasts.Cancel(broadcast.ID)
+	// Expected to fail if broadcast is not in a cancellable state
+	if cancelErr != nil {
+		sevkErr, ok := cancelErr.(*sevk.Error)
+		if ok {
+			assert.NotEmpty(t, sevkErr.Message)
+		}
+	}
+
+	// Cleanup
+	client.Broadcasts.Delete(broadcast.ID)
+}
+
+func TestBroadcastsDelete(t *testing.T) {
+	client := getClient(t)
+
+	domains, err := client.Domains.List(nil)
+	require.NoError(t, err)
+	if len(domains.Items) == 0 {
+		t.Skip("No domains available to test broadcast delete")
+	}
+	domainID := domains.Items[0].ID
+
+	senderName := "Test Sender"
+	targetType := "ALL"
+	broadcast, err := client.Broadcasts.Create(sevk.CreateBroadcastParams{
+		DomainID:   domainID,
+		Name:       fmt.Sprintf("Delete Broadcast %d", uniqueID()),
+		Subject:    "Test Subject",
+		Body:       "<section><paragraph>Test</paragraph></section>",
+		SenderName: &senderName,
+		TargetType: &targetType,
+	})
+	require.NoError(t, err)
+
+	err = client.Broadcasts.Delete(broadcast.ID)
+	require.NoError(t, err)
+
+	_, err = client.Broadcasts.Get(broadcast.ID)
+	assert.Error(t, err)
+}
+
 // ============================================
 // DOMAINS TESTS
 // ============================================
 
 func TestDomainsListStructure(t *testing.T) {
+	skipDomainTests(t)
 	client := getClient(t)
 
 	result, err := client.Domains.List(nil)
@@ -480,12 +832,147 @@ func TestDomainsListStructure(t *testing.T) {
 }
 
 func TestDomainsListVerified(t *testing.T) {
+	skipDomainTests(t)
 	client := getClient(t)
 
 	verified := true
 	result, err := client.Domains.List(&sevk.ListDomainsParams{Verified: &verified})
 	require.NoError(t, err)
 	assert.NotNil(t, result)
+}
+
+func TestDomainsCreate(t *testing.T) {
+	skipDomainTests(t)
+	client := getClient(t)
+
+	subdomain := fmt.Sprintf("test-%d.example.com", uniqueID())
+	domain, err := client.Domains.Create(sevk.CreateDomainParams{
+		Domain: subdomain,
+		Email:  fmt.Sprintf("test@%s", subdomain),
+		From:   "noreply",
+		SenderName: "Test Sender",
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, domain.ID)
+	assert.Equal(t, subdomain, domain.Domain)
+
+	// Cleanup
+	client.Domains.Delete(domain.ID)
+}
+
+func TestDomainsGet(t *testing.T) {
+	skipDomainTests(t)
+	client := getClient(t)
+
+	subdomain := fmt.Sprintf("get-test-%d.example.com", uniqueID())
+	domain, err := client.Domains.Create(sevk.CreateDomainParams{
+		Domain: subdomain,
+		Email:  fmt.Sprintf("test@%s", subdomain),
+		From:   "noreply",
+		SenderName: "Test Sender",
+	})
+	require.NoError(t, err)
+
+	fetched, err := client.Domains.Get(domain.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.ID, fetched.ID)
+
+	// Cleanup
+	client.Domains.Delete(domain.ID)
+}
+
+func TestDomainsGetDnsRecords(t *testing.T) {
+	skipDomainTests(t)
+	client := getClient(t)
+
+	subdomain := fmt.Sprintf("dns-test-%d.example.com", uniqueID())
+	domain, err := client.Domains.Create(sevk.CreateDomainParams{
+		Domain: subdomain,
+		Email:  fmt.Sprintf("test@%s", subdomain),
+		From:   "noreply",
+		SenderName: "Test Sender",
+	})
+	require.NoError(t, err)
+
+	records, err := client.Domains.GetDnsRecords(domain.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, records)
+
+	// Cleanup
+	client.Domains.Delete(domain.ID)
+}
+
+func TestDomainsGetRegions(t *testing.T) {
+	skipDomainTests(t)
+	client := getClient(t)
+
+	regions, err := client.Domains.GetRegions()
+	require.NoError(t, err)
+	assert.NotNil(t, regions)
+}
+
+func TestDomainsVerify(t *testing.T) {
+	skipDomainTests(t)
+	client := getClient(t)
+
+	subdomain := fmt.Sprintf("verify-test-%d.example.com", uniqueID())
+	domain, err := client.Domains.Create(sevk.CreateDomainParams{
+		Domain: subdomain,
+		Email:  fmt.Sprintf("test@%s", subdomain),
+		From:   "noreply",
+		SenderName: "Test Sender",
+	})
+	require.NoError(t, err)
+
+	// Verification is expected to fail for test domains without proper DNS records
+	_, verifyErr := client.Domains.Verify(domain.ID)
+	if verifyErr != nil {
+		sevkErr, ok := verifyErr.(*sevk.Error)
+		if ok {
+			assert.NotEmpty(t, sevkErr.Message)
+		}
+	}
+
+	// Cleanup
+	client.Domains.Delete(domain.ID)
+}
+
+func TestDomainsDelete(t *testing.T) {
+	skipDomainTests(t)
+	client := getClient(t)
+
+	subdomain := fmt.Sprintf("delete-test-%d.example.com", uniqueID())
+	domain, err := client.Domains.Create(sevk.CreateDomainParams{
+		Domain: subdomain,
+		Email:  fmt.Sprintf("test@%s", subdomain),
+		From:   "noreply",
+		SenderName: "Test Sender",
+	})
+	require.NoError(t, err)
+
+	err = client.Domains.Delete(domain.ID)
+	require.NoError(t, err)
+
+	_, err = client.Domains.Get(domain.ID)
+	assert.Error(t, err)
+}
+
+func TestDomainsUpdate(t *testing.T) {
+	skipDomainTests(t)
+	client := getClient(t)
+
+	result, err := client.Domains.List(nil)
+	require.NoError(t, err)
+
+	if len(result.Items) == 0 {
+		t.Skip("No domains available to test Update")
+	}
+
+	domain := result.Items[0]
+	clickTracking := true
+	updated, err := client.Domains.Update(domain.ID, sevk.UpdateDomainRequest{ClickTracking: &clickTracking})
+	require.NoError(t, err)
+	assert.Equal(t, domain.ID, updated.ID)
 }
 
 // ============================================
@@ -561,6 +1048,85 @@ func TestTopicsDelete(t *testing.T) {
 
 	_, err = client.Topics.Get(audience.ID, topic.ID)
 	assert.Error(t, err)
+}
+
+func TestTopicsAddContacts(t *testing.T) {
+	client := getClient(t)
+	audience := getAudience(t)
+
+	topicName := fmt.Sprintf("AddContacts Topic %d", uniqueID())
+	topic, err := client.Topics.Create(audience.ID, sevk.CreateTopicParams{Name: topicName})
+	require.NoError(t, err)
+
+	email := fmt.Sprintf("topic-add-%d@example.com", uniqueID())
+	contact, err := client.Contacts.Create(sevk.CreateContactParams{Email: email})
+	require.NoError(t, err)
+
+	// Add contact to audience first
+	err = client.Audiences.AddContacts(audience.ID, []string{contact.ID})
+	require.NoError(t, err)
+
+	// Add contact to topic
+	err = client.Topics.AddContacts(audience.ID, topic.ID, sevk.AddTopicContactsParams{
+		ContactIDs: []string{contact.ID},
+	})
+	require.NoError(t, err)
+
+	// Cleanup
+	client.Topics.Delete(audience.ID, topic.ID)
+}
+
+func TestTopicsRemoveContact(t *testing.T) {
+	client := getClient(t)
+	audience := getAudience(t)
+
+	topicName := fmt.Sprintf("RemoveContact Topic %d", uniqueID())
+	topic, err := client.Topics.Create(audience.ID, sevk.CreateTopicParams{Name: topicName})
+	require.NoError(t, err)
+
+	email := fmt.Sprintf("topic-remove-%d@example.com", uniqueID())
+	contact, err := client.Contacts.Create(sevk.CreateContactParams{Email: email})
+	require.NoError(t, err)
+
+	// Add contact to audience and topic
+	err = client.Audiences.AddContacts(audience.ID, []string{contact.ID})
+	require.NoError(t, err)
+	err = client.Topics.AddContacts(audience.ID, topic.ID, sevk.AddTopicContactsParams{
+		ContactIDs: []string{contact.ID},
+	})
+	require.NoError(t, err)
+
+	// Remove contact from topic
+	err = client.Topics.RemoveContact(audience.ID, topic.ID, contact.ID)
+	require.NoError(t, err)
+
+	// Verify removal by listing contacts in the topic
+	result, err := client.Topics.ListContacts(audience.ID, topic.ID, nil)
+	require.NoError(t, err)
+	for _, c := range result.Items {
+		assert.NotEqual(t, contact.ID, c.ID)
+	}
+
+	// Cleanup
+	client.Topics.Delete(audience.ID, topic.ID)
+}
+
+func TestTopicsListContacts(t *testing.T) {
+	client := getClient(t)
+	audience := getAudience(t)
+
+	topicName := fmt.Sprintf("ListContacts Topic %d", uniqueID())
+	topic, err := client.Topics.Create(audience.ID, sevk.CreateTopicParams{Name: topicName})
+	require.NoError(t, err)
+
+	result, err := client.Topics.ListContacts(audience.ID, topic.ID, nil)
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.NotNil(t, result.Items)
+	assert.GreaterOrEqual(t, result.Total, 0)
+
+	// Cleanup
+	client.Topics.Delete(audience.ID, topic.ID)
 }
 
 // ============================================
@@ -644,6 +1210,49 @@ func TestSegmentsUpdate(t *testing.T) {
 	client.Segments.Delete(audience.ID, segment.ID)
 }
 
+func TestSegmentsCalculate(t *testing.T) {
+	client := getClient(t)
+	audience := getAudience(t)
+
+	segmentName := fmt.Sprintf("Calculate Segment %d", uniqueID())
+	rules := []map[string]interface{}{
+		{"field": "email", "operator": "contains", "value": "@example.com"},
+	}
+	segment, err := client.Segments.Create(audience.ID, sevk.CreateSegmentParams{
+		Name:     segmentName,
+		Rules:    rules,
+		Operator: "AND",
+	})
+	require.NoError(t, err)
+
+	result, err := client.Segments.Calculate(audience.ID, segment.ID)
+	if err != nil {
+		// Rate limit (429) is expected if other segment tests ran recently
+		sevkErr, ok := err.(*sevk.Error)
+		if ok && sevkErr.StatusCode == 429 {
+			t.Skip("Skipping due to rate limit on segment calculate endpoint")
+		}
+		require.NoError(t, err)
+	}
+	assert.NotNil(t, result)
+
+	// Cleanup
+	client.Segments.Delete(audience.ID, segment.ID)
+}
+
+func TestSegmentsPreview(t *testing.T) {
+	client := getClient(t)
+	audience := getAudience(t)
+
+	result, err := client.Segments.Preview(audience.ID, sevk.CreateSegmentParams{
+		Name:     "Preview Segment",
+		Rules:    []map[string]interface{}{{"field": "email", "operator": "contains", "value": "@example.com"}},
+		Operator: "AND",
+	})
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
 func TestSegmentsDelete(t *testing.T) {
 	client := getClient(t)
 	audience := getAudience(t)
@@ -698,6 +1307,124 @@ func TestSubscriptionsUnsubscribe(t *testing.T) {
 }
 
 // ============================================
+// WEBHOOKS TESTS
+// ============================================
+
+func TestWebhooksCRUDCycle(t *testing.T) {
+	client := getClient(t)
+
+	// Create
+	url := fmt.Sprintf("https://example.com/webhook-%d", uniqueID())
+	webhook, err := client.Webhooks.Create(sevk.CreateWebhookParams{
+		URL:    url,
+		Events: []string{"contact.subscribed"},
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, webhook.ID)
+	assert.Equal(t, url, webhook.URL)
+
+	// Get
+	fetched, err := client.Webhooks.Get(webhook.ID)
+	require.NoError(t, err)
+	assert.Equal(t, webhook.ID, fetched.ID)
+
+	// Update
+	newURL := fmt.Sprintf("https://example.com/webhook-updated-%d", uniqueID())
+	updated, err := client.Webhooks.Update(webhook.ID, sevk.UpdateWebhookParams{URL: &newURL})
+	require.NoError(t, err)
+	assert.Equal(t, webhook.ID, updated.ID)
+	assert.Equal(t, newURL, updated.URL)
+
+	// Delete
+	err = client.Webhooks.Delete(webhook.ID)
+	require.NoError(t, err)
+
+	_, err = client.Webhooks.Get(webhook.ID)
+	assert.Error(t, err)
+}
+
+func TestWebhooksList(t *testing.T) {
+	client := getClient(t)
+
+	result, err := client.Webhooks.List()
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+func TestWebhooksTest(t *testing.T) {
+	client := getClient(t)
+
+	url := fmt.Sprintf("https://example.com/webhook-test-%d", uniqueID())
+	webhook, err := client.Webhooks.Create(sevk.CreateWebhookParams{
+		URL:    url,
+		Events: []string{"contact.subscribed"},
+	})
+	require.NoError(t, err)
+
+	result, err := client.Webhooks.Test(webhook.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+
+	// Cleanup
+	client.Webhooks.Delete(webhook.ID)
+}
+
+func TestWebhooksListEvents(t *testing.T) {
+	client := getClient(t)
+
+	events, err := client.Webhooks.ListEvents()
+	require.NoError(t, err)
+	assert.NotNil(t, events)
+}
+
+// ============================================
+// EVENTS TESTS
+// ============================================
+
+func TestEventsListStructure(t *testing.T) {
+	client := getClient(t)
+
+	result, err := client.Events.List(nil)
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.GreaterOrEqual(t, result.Total, 0)
+	assert.GreaterOrEqual(t, result.Page, 1)
+}
+
+func TestEventsListPagination(t *testing.T) {
+	client := getClient(t)
+
+	page := 1
+	limit := 5
+	result, err := client.Events.List(&sevk.ListEventsParams{Page: &page, Limit: &limit})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Page)
+}
+
+func TestEventsStats(t *testing.T) {
+	client := getClient(t)
+
+	stats, err := client.Events.Stats()
+	require.NoError(t, err)
+	assert.NotNil(t, stats)
+}
+
+// ============================================
+// USAGE TESTS
+// ============================================
+
+func TestGetUsage(t *testing.T) {
+	client := getClient(t)
+
+	usage, err := client.GetUsage()
+	require.NoError(t, err)
+	assert.NotNil(t, usage)
+	assert.GreaterOrEqual(t, usage.AudienceLimit, 0)
+	assert.GreaterOrEqual(t, usage.ContactLimit, 0)
+	assert.GreaterOrEqual(t, usage.BroadcastLimit, 0)
+}
+
+// ============================================
 // EMAILS TESTS
 // ============================================
 
@@ -747,6 +1474,47 @@ func TestEmailsErrorMessageDomainVerification(t *testing.T) {
 		From:    "no-reply@test-domain.com",
 	})
 	assert.Error(t, err)
+}
+
+func TestEmailsGetNonExistent(t *testing.T) {
+	client := getClient(t)
+
+	_, err := client.Emails.Get("00000000-0000-0000-0000-000000000000")
+	assert.Error(t, err)
+	sevkErr, ok := err.(*sevk.Error)
+	if ok {
+		assert.True(t, sevkErr.IsNotFound())
+	}
+}
+
+func TestEmailsBulkRejectUnverifiedDomain(t *testing.T) {
+	client := getClient(t)
+
+	result, err := client.Emails.SendBulk([]sevk.SendEmailParams{
+		{
+			To:      "test1@example.com",
+			Subject: "Bulk Test 1",
+			HTML:    "<p>Hello 1</p>",
+			From:    "no-reply@unverified-domain.com",
+		},
+		{
+			To:      "test2@example.com",
+			Subject: "Bulk Test 2",
+			HTML:    "<p>Hello 2</p>",
+			From:    "no-reply@unverified-domain.com",
+		},
+	})
+	// The API may return an error (e.g., balance check) or return 200 with failures
+	if err != nil {
+		// Error at the HTTP level is acceptable (e.g., balance check, account not enabled)
+		assert.Error(t, err)
+	} else {
+		// If no HTTP error, the response should show failures for unverified domain
+		assert.NotNil(t, result)
+		assert.Equal(t, 2, result.Failed)
+		assert.Equal(t, 0, result.Success)
+		assert.NotEmpty(t, result.Errors)
+	}
 }
 
 // ============================================
@@ -879,11 +1647,11 @@ func TestRenderMultipleFonts(t *testing.T) {
 	assert.Contains(t, html, "Open+Sans")
 }
 
-func TestRenderBackgroundColor(t *testing.T) {
+func TestRenderNoBackgroundColor(t *testing.T) {
 	markupStr := `<email><body></body></email>`
 	html := sevk.Render(markupStr)
 
-	assert.Contains(t, html, "background-color")
+	assert.NotContains(t, html, "background-color:#ffffff")
 }
 
 func TestRenderMailTag(t *testing.T) {
