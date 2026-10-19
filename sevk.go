@@ -1,28 +1,30 @@
-// Package sevk provides the official Go SDK for Sevk - Email Marketing Platform
+// Package sevk provides the official Go SDK for the sevk email platform.
 package sevk
 
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
 const (
+	// Version is the current version of the sevk Go SDK.
+	Version = "1.1.0"
+
 	defaultBaseURL = "https://api.sevk.io"
 	defaultTimeout = 30 * time.Second
 )
 
-// Client is the main entry point for the Sevk SDK
+// Client is the main entry point for the sevk SDK.
 type Client struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
 
-	// Resources
 	Contacts      *ContactsResource
 	Audiences     *AudiencesResource
 	Templates     *TemplatesResource
@@ -33,27 +35,31 @@ type Client struct {
 	Subscriptions *SubscriptionsResource
 	Emails        *EmailsResource
 	Webhooks      *WebhooksResource
-	Events        *EventsResource
+	Activity      *ActivityResource
+	Inbound       *InboundResource
+	Outbound      *OutboundResource
+	Usage         *UsageResource
 }
 
-// Options for configuring the Sevk client
+// Options configures a Client.
 type Options struct {
 	BaseURL    string
 	HTTPClient *http.Client
 	Timeout    time.Duration
 }
 
-// New creates a new Sevk client with the given API key
+// New creates a client with the given API key.
 func New(apiKey string) *Client {
 	return NewWithOptions(apiKey, Options{})
 }
 
-// NewWithOptions creates a new Sevk client with custom options
+// NewWithOptions creates a client with custom options.
 func NewWithOptions(apiKey string, opts Options) *Client {
 	baseURL := defaultBaseURL
 	if opts.BaseURL != "" {
 		baseURL = opts.BaseURL
 	}
+	baseURL = strings.TrimRight(baseURL, "/")
 
 	httpClient := opts.HTTPClient
 	if httpClient == nil {
@@ -62,6 +68,15 @@ func NewWithOptions(apiKey string, opts Options) *Client {
 			timeout = opts.Timeout
 		}
 		httpClient = &http.Client{Timeout: timeout}
+	} else {
+		copy := *httpClient
+		if opts.Timeout > 0 {
+			copy.Timeout = opts.Timeout
+		}
+		httpClient = &copy
+	}
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 
 	c := &Client{
@@ -70,7 +85,6 @@ func NewWithOptions(apiKey string, opts Options) *Client {
 		httpClient: httpClient,
 	}
 
-	// Initialize resources
 	c.Contacts = &ContactsResource{client: c}
 	c.Audiences = &AudiencesResource{client: c}
 	c.Templates = &TemplatesResource{client: c}
@@ -81,131 +95,112 @@ func NewWithOptions(apiKey string, opts Options) *Client {
 	c.Subscriptions = &SubscriptionsResource{client: c}
 	c.Emails = &EmailsResource{client: c}
 	c.Webhooks = &WebhooksResource{client: c}
-	c.Events = &EventsResource{client: c}
+	c.Activity = &ActivityResource{client: c}
+	c.Inbound = &InboundResource{client: c}
+	c.Outbound = &OutboundResource{client: c}
+	c.Usage = &UsageResource{client: c}
 
 	return c
 }
 
-// request makes an HTTP request to the Sevk API
-func (c *Client) request(method, path string, body interface{}, result interface{}) error {
+func (c *Client) request(method, path string, body any, result any) error {
+	return c.requestWithHeaders(method, path, body, nil, result)
+}
+
+func (c *Client) requestWithHeaders(method, path string, body any, extraHeaders map[string]string, result any) error {
 	u, err := url.Parse(c.baseURL + path)
 	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
+		return newRequestError(err)
 	}
 
 	var bodyReader io.Reader
 	if body != nil {
 		jsonBody, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("failed to marshal request body: %w", err)
+			return &Error{Message: "failed to marshal request body: " + err.Error(), Code: "SERIALIZATION_ERROR", cause: err}
 		}
 		bodyReader = bytes.NewReader(jsonBody)
 	}
 
 	req, err := http.NewRequest(method, u.String(), bodyReader)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return newRequestError(err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "sevk-go/"+Version)
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return newRequestError(err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
+		return newRequestError(err)
 	}
 
-	if resp.StatusCode >= 400 {
-		var apiErr APIError
-		if err := json.Unmarshal(respBody, &apiErr); err != nil {
-			return &Error{
-				StatusCode: resp.StatusCode,
-				Message:    string(respBody),
-			}
-		}
-		return &Error{
-			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
-			Code:       apiErr.Code,
-		}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return parseAPIError(resp.StatusCode, resp.Header, respBody)
 	}
 
-	if result != nil && len(respBody) > 0 {
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+
+	if result != nil {
+		var root any
+		if len(bytes.TrimSpace(respBody)) == 0 || json.Unmarshal(respBody, &root) != nil {
+			return invalidResponseError(resp.StatusCode, respBody)
+		}
+		if _, ok := root.(map[string]any); !ok {
+			return invalidResponseError(resp.StatusCode, respBody)
+		}
 		if err := json.Unmarshal(respBody, result); err != nil {
-			return fmt.Errorf("failed to unmarshal response: %w", err)
+			decodeError := invalidResponseError(resp.StatusCode, respBody)
+			decodeError.cause = err
+			return decodeError
 		}
 	}
 
 	return nil
 }
 
-// get makes a GET request
-func (c *Client) get(path string, result interface{}) error {
+func invalidResponseError(statusCode int, body []byte) *Error {
+	return &Error{
+		StatusCode:   statusCode,
+		Message:      "expected a JSON object response",
+		Code:         "INVALID_RESPONSE",
+		ResponseBody: string(body),
+	}
+}
+
+func (c *Client) get(path string, result any) error {
 	return c.request(http.MethodGet, path, nil, result)
 }
 
-// post makes a POST request
-func (c *Client) post(path string, body interface{}, result interface{}) error {
+func (c *Client) post(path string, body any, result any) error {
 	return c.request(http.MethodPost, path, body, result)
 }
 
-// patch makes a PATCH request
-func (c *Client) patch(path string, body interface{}, result interface{}) error {
+func (c *Client) postWithHeaders(path string, body any, headers map[string]string, result any) error {
+	return c.requestWithHeaders(http.MethodPost, path, body, headers, result)
+}
+
+func (c *Client) patch(path string, body any, result any) error {
 	return c.request(http.MethodPatch, path, body, result)
 }
 
-// put makes a PUT request
-func (c *Client) put(path string, body interface{}, result interface{}) error {
+func (c *Client) put(path string, body any, result any) error {
 	return c.request(http.MethodPut, path, body, result)
 }
 
-// delete makes a DELETE request
-func (c *Client) delete(path string) error {
-	return c.request(http.MethodDelete, path, nil, nil)
-}
-
-// Usage represents project usage and limits data
-type Usage struct {
-	Balance        string                 `json:"balance"`
-	EmailPrice     string                 `json:"emailPrice"`
-	AudienceLimit  int                    `json:"audienceLimit"`
-	ContactLimit   int                    `json:"contactLimit"`
-	BroadcastLimit int                    `json:"broadcastLimit"`
-	DomainLimit    int                    `json:"domainLimit"`
-	StorageLimit   string                 `json:"storageLimit"`
-	StorageUsed    string                 `json:"storageUsed"`
-	EmailStats     EmailStats             `json:"emailStats"`
-	EmailLimits    map[string]interface{} `json:"emailLimits"`
-	Count          UsageCount             `json:"_count"`
-}
-
-// EmailStats represents email statistics
-type EmailStats struct {
-	Total         int `json:"total"`
-	Marketing     int `json:"marketing"`
-	Transactional int `json:"transactional"`
-}
-
-// UsageCount represents resource counts
-type UsageCount struct {
-	Audiences  int `json:"audiences"`
-	Contacts   int `json:"contacts"`
-	Broadcasts int `json:"broadcasts"`
-	Domains    int `json:"domains"`
-}
-
-// GetUsage returns project usage and limits
-func (c *Client) GetUsage() (*Usage, error) {
-	var result Usage
-	if err := c.get("/limits", &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+func (c *Client) delete(path string, result any) error {
+	return c.request(http.MethodDelete, path, nil, result)
 }

@@ -1,6 +1,6 @@
 module github.com/sevk-io/sevk-go
 
-go 1.21
+go 1.19
 
 require (
 	github.com/alecthomas/chroma/v2 v2.14.0

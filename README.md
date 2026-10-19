@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="https://sevk.io/logo.png" alt="Sevk" width="120" />
+  <img src="https://sevk.io/logo.png" alt="sevk" width="120" />
 </p>
 
-<h1 align="center">Sevk Go SDK</h1>
+<h1 align="center">sevk Go SDK</h1>
 
 <p align="center">
-  Official Go SDK for <a href="https://sevk.io">Sevk</a> email platform.
+  Official Go SDK for <a href="https://sevk.io">sevk</a> email platform.
 </p>
 
 <p align="center">
@@ -29,11 +29,11 @@ import "github.com/sevk-io/sevk-go"
 func main() {
     client := sevk.New("your-api-key")
 
-    client.Emails.Send(&sevk.SendEmailRequest{
-        To:      "recipient@example.com",
+    client.Emails.Send(sevk.SendEmailParams{
+        To:      sevk.StringOrList{"recipient@example.com"},
         From:    "hello@yourdomain.com",
-        Subject: "Hello from Sevk!",
-        Html:    "<h1>Welcome!</h1>",
+        Subject: "Hello from sevk!",
+        HTML:    "<h1>Welcome!</h1>",
     })
 }
 ```
@@ -44,6 +44,8 @@ func main() {
 package main
 
 import (
+    "log"
+
     "github.com/sevk-io/sevk-go"
     "github.com/sevk-io/sevk-go/markup"
 )
@@ -51,7 +53,7 @@ import (
 func main() {
     client := sevk.New("your-api-key")
 
-    html := markup.Render(`
+    html, err := markup.Render(`
       <section padding="40px 20px" background-color="#f8f9fa">
         <container max-width="600px">
           <heading level="1" color="#1a1a1a">Welcome!</heading>
@@ -62,12 +64,15 @@ func main() {
         </container>
       </section>
     `)
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    client.Emails.Send(&sevk.SendEmailRequest{
-        To:      "recipient@example.com",
+    client.Emails.Send(sevk.SendEmailParams{
+        To:      sevk.StringOrList{"recipient@example.com"},
         From:    "hello@yourdomain.com",
         Subject: "Welcome!",
-        Html:    html,
+        HTML:    html,
     })
 }
 ```
